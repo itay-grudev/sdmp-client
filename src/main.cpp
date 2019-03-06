@@ -1,11 +1,7 @@
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <unistd.h>
 #include <getopt.h>
 #include <iostream>
 #include <gnutls/gnutls.h>
-
 
 #include "utilities.h"
 
@@ -28,19 +24,14 @@ inline int error(){
     return 1;
 }
 
-/**
- * Prompts the user for credentials
- * @param  gnutls_session_t
- * @param  username
- * @param  password
- * @return 0 on success -1 on error
- */
-int credentials_entry( gnutls_session_t, char*[], char*[] );
+char * username = nullptr;
+char * password = nullptr;
+
+// Defined in credentials_entry.cpp
+int credentials_entry( gnutls_session_t, char** , char** );
 
 int main( int argc, char* argv[] )
 {
-    char * username = nullptr;
-    char * password = nullptr;
     gnutls_session_t session;
     gnutls_srp_client_credentials_t srp_cred;
     gnutls_certificate_credentials_t cert_cred;
@@ -107,124 +98,87 @@ int main( int argc, char* argv[] )
     if( username != nullptr && password != nullptr ){
         gnutls_srp_set_client_credentials( srp_cred, username, password );
     } else {
-        // Prompt the user to input their credentials via credentials_entry
+        // Prompt the user to input their credentials
         gnutls_srp_set_client_credentials_function( srp_cred, credentials_entry );
     }
 
+    gnutls_certificate_set_x509_trust_file( cert_cred, CAFILE, GNUTLS_X509_FMT_PEM );
 
-        gnutls_certificate_set_x509_trust_file( cert_cred, CAFILE, GNUTLS_X509_FMT_PEM );
+    // Connects to server
+    sd = tcp_connect();
 
-        // Connects to server
-        sd = tcp_connect();
+    // Initialize TLS session
+    gnutls_init( &session, GNUTLS_CLIENT );
 
-        // Initialize TLS session
-        gnutls_init(&session, GNUTLS_CLIENT);
+    // Set the priorities
+    gnutls_priority_set_direct(
+        session,
+        "NORMAL:+SRP:+SRP-RSA:+SRP-DSS",
+        NULL
+    );
 
+    // Put the SRP credentials to the current session
+    gnutls_credentials_set( session, GNUTLS_CRD_SRP, srp_cred );
+    gnutls_credentials_set( session, GNUTLS_CRD_CERTIFICATE, cert_cred );
 
-        // Set the priorities.
-        gnutls_priority_set_direct(session,
-                                   "NORMAL:+SRP:+SRP-RSA:+SRP-DSS",
-                                   NULL);
+    gnutls_transport_set_int( session, sd );
+    gnutls_handshake_set_timeout( session, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT );
 
-        // Put the SRP credentials to the current session
-        gnutls_credentials_set(session, GNUTLS_CRD_SRP, srp_cred);
-        gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, cert_cred);
+    // Perform the TLS handshake
+    do {
+        ret = gnutls_handshake( session );
+    }
+    while (ret < 0 && gnutls_error_is_fatal(ret) == 0);
 
-        gnutls_transport_set_int(session, sd);
-        gnutls_handshake_set_timeout(session,
-                                     GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
+    if (ret < 0) {
+        std::cerr << "*** Handshake failed" << std::endl;
+        gnutls_perror(ret);
+        goto end;
+    } else {
+        char *desc;
 
-        // Perform the TLS handshake
-        do {
-                ret = gnutls_handshake(session);
-        }
-        while (ret < 0 && gnutls_error_is_fatal(ret) == 0);
+        desc = gnutls_session_get_desc( session );
+        std::printf( "- Session info: %s\n", desc );
+        gnutls_free(desc);
+    }
 
-        if (ret < 0) {
-                std::cerr <<"*** Handshake failed" << std::endl;
-                gnutls_perror(ret);
-                goto end;
+    gnutls_record_send( session, MSG, strlen(MSG) );
+
+    ret = gnutls_record_recv( session, buffer, MAX_BUF );
+    if (gnutls_error_is_fatal(ret) != 0 || ret == 0) {
+        if (ret == 0) {
+            std::cout << "- Peer has closed the GnuTLS connection" << std::endl;
+            goto end;
         } else {
-                char *desc;
-
-                desc = gnutls_session_get_desc(session);
-                std::printf("- Session info: %s\n", desc);
-                gnutls_free(desc);
+            std::cerr << "*** Error: \n" << gnutls_strerror( ret ) << std::endl;
+            goto end;
         }
+    } else {
+        check_alert( session, ret );
+    }
 
-        gnutls_record_send(session, MSG, strlen(MSG));
-
-        ret = gnutls_record_recv(session, buffer, MAX_BUF);
-        if (gnutls_error_is_fatal(ret) != 0 || ret == 0) {
-                if (ret == 0) {
-                        std::printf
-                            ("- Peer has closed the GnuTLS connection\n" );
-                        goto end;
-                } else {
-                        std::cerr << "*** Error: \n" << gnutls_strerror(ret) << std::endl;
-                        goto end;
-                }
-        } else
-                check_alert(session, ret);
-
-        if (ret > 0) {
-                std::printf("- Received %d bytes: ", ret);
-                for (ii = 0; ii < ret; ii++) {
-                        fputc(buffer[ii], stdout);
-                }
-                fputs("\n", stdout);
+    if (ret > 0) {
+        std::printf( "- Received %d bytes: ", ret );
+        for( ii = 0; ii < ret; ii++ ) {
+            fputc( buffer[ii], stdout );
         }
-        gnutls_bye(session, GNUTLS_SHUT_RDWR);
-
-      end:
-
-        tcp_close(sd);
-
-        gnutls_deinit(session);
-
-        gnutls_srp_free_client_credentials(srp_cred);
-        gnutls_certificate_free_credentials(cert_cred);
-
-        gnutls_global_deinit();
-
-        return 0;
-}
-typedef struct gnutls_srp_client_credentials_st {
-	char *username;
-	char *password;
-};
-int credentials_entry( gnutls_session_t session, char** username, char** password ){
-    char *tmp;
-
-    gnutls_srp_client_credentials_t *srp_cred;
-    gnutls_credentials_get( session, GNUTLS_CRD_SRP, (void**)&srp_cred );
-    printf("cred user %s\n", srp_cred->username );
-    printf("cred pass %s\n", srp_cred.password );
-
-    // If the username is not specified as a command line argument attempt to
-    // get the USER environment variable or abort.
-    std::string user;
-    tmp = std::getenv( "USER" );
-    if( ! tmp ){
-        std::cout << "Enter username: " << std::flush;
-        std::cin >> user;
-        tmp = (char*)user.c_str();
+        fputs( "\n", stdout );
     }
-    if( ! tmp ){
-        std::cerr << "Error: No username specified!" << std::endl;
-        return -1;
-    }
-    *username = (char*)gnutls_malloc( strlen( tmp ) + 2 );
-    strcpy( *username, tmp );
 
-    // If no password is specified prompt the user to enter a password
-    tmp = getpass( "Enter password: " );
-    if( ! tmp ){
-        std::cerr << "Error: No password specified!" << std::endl;
-        return -1;
-    }
-    *password = (char*)gnutls_malloc( strlen( tmp ) + 2 );
-    strcpy( *password, tmp );
+    gnutls_bye( session, GNUTLS_SHUT_RDWR );
+
+end:
+    tcp_close( sd );
+    gnutls_deinit( session );
+
+    gnutls_srp_free_client_credentials( srp_cred );
+    gnutls_certificate_free_credentials( cert_cred );
+
+    gnutls_global_deinit();
 
     return 0;
+}
+
+void help(){
+    // TODO:
 }
